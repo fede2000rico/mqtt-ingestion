@@ -1,0 +1,13 @@
+{
+    "machines": [
+        {
+            "machine_id": "machine_01",
+            "expected_messages": [
+                "recipe_id",
+                "job_id",
+                "batch_id",
+                "status"
+            ]
+        }
+    ]
+}
