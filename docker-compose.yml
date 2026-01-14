@@ -46,7 +46,7 @@ services:
       TOPIC_NAME: ${TOPIC_NAME}
 
   ingestion:
-    build: ./ingestion_aggregated
+    build: ./ingestion
     container_name: ingestion-service
     depends_on:
       rabbitmq:
@@ -60,10 +60,9 @@ services:
       RABBITMQ_PASS: ${RABBITMQ_DEFAULT_PASS}
       TOPIC_NAME: ${TOPIC_NAME}
       INFLUXDB_URL: ${INFLUXDB_URL}
+      INFLUXDB_TOKEN: ${INFLUXDB_TOKEN}
       INFLUXDB_ORG: ${DOCKER_INFLUXDB_INIT_ORG}
       INFLUXDB_BUCKET: ${DOCKER_INFLUXDB_INIT_BUCKET}
-    volumes:
-      - ./machines_config.json:/app/machines_config.json
 
 volumes:
   influxdb_data:
