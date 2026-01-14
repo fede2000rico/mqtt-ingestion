@@ -45,23 +45,11 @@ class MachineBuffer:
         return row_data
 
 class IngestionManager:
-    def __init__(self, config: Dict):
+    def __init__(self, config: Dict, db_backend):
         self.config = config
+        self.db = db_backend
         self.machines: Dict[str, MachineBuffer] = {}
         
-        # InfluxDB Init
-        self.url = os.getenv("INFLUXDB_URL", "http://influxdb:8086")
-        self.token = os.getenv("INFLUXDB_TOKEN", "my-super-secret-auth-token")
-        self.org = os.getenv("INFLUXDB_ORG", "my-org")
-        self.bucket = os.getenv("INFLUXDB_BUCKET", "machine_data")
-        
-        try:
-            self.client = InfluxDBClient(url=self.url, token=self.token, org=self.org)
-            self.write_api = self.client.write_api(write_options=SYNCHRONOUS)
-            logging.info("InfluxDB Client Initialized (Buffered Mode)")
-        except Exception as e:
-            logging.error(f"Failed to init InfluxDB: {e}")
-
         # Initialize Machines
         for m in config.get("machines", []):
             mid = m["machine_id"]
@@ -128,11 +116,11 @@ class IngestionManager:
             if model.speed is not None: point.field("speed", model.speed)
             if model.alarm_code: point.field("alarm_code", model.alarm_code)
 
-            self.write_api.write(bucket=self.bucket, org=self.org, record=point)
+            self.db.write_point(point)
             logging.info(f"[{model.machine_id}] WROTE Buffered Row: {model.model_dump(exclude_none=True)}")
             
         except Exception as e:
             logging.error(f"Write Error: {e}")
 
     def close(self):
-        self.client.close()
+        self.db.close()

@@ -4,6 +4,7 @@ import json
 import logging
 import paho.mqtt.client as mqtt
 from manager import IngestionManager
+from database import InfluxBackend
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -30,8 +31,13 @@ except Exception as e:
     logging.error(f"Failed to load config: {e}")
     exit(1)
 
-# Initialize Manager
-manager = IngestionManager(config)
+# Initialize Components
+try:
+    db_backend = InfluxBackend()
+    manager = IngestionManager(config, db_backend)
+except Exception as e:
+    logging.error(f"Failed to initialize components: {e}")
+    exit(1)
 
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
