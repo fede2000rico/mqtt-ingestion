@@ -3,8 +3,8 @@ import time
 import json
 import logging
 import paho.mqtt.client as mqtt
-from influxdb_client import InfluxDBClient, Point
-from influxdb_client.client.write_api import SYNCHRONOUS
+from influxdb_client import Point
+from database import InfluxBackend
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -14,13 +14,11 @@ USER = os.getenv("RABBITMQ_USER", "user")
 PASSWORD = os.getenv("RABBITMQ_PASS", "password")
 TOPIC = os.getenv("TOPIC_NAME", "machine/data")
 
-INFLUX_URL = os.getenv("INFLUXDB_URL", "http://influxdb:8086")
-INFLUX_TOKEN = os.getenv("INFLUXDB_TOKEN", "my-super-secret-auth-token")
-INFLUX_ORG = os.getenv("INFLUXDB_ORG", "my-org")
-INFLUX_BUCKET = os.getenv("INFLUXDB_BUCKET", "machine_data")
-
-influx_client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
-write_api = influx_client.write_api(write_options=SYNCHRONOUS)
+# Init DB
+try:
+    db = InfluxBackend()
+except Exception:
+    exit(1)
 
 def on_connect(client, userdata, flags, rc):
     logging.info(f"Connected to RabbitMQ Broker! Code: {rc}")
@@ -38,7 +36,7 @@ def on_message(client, userdata, msg):
             else:
                 point = point.tag(k, str(v))
         
-        write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=point)
+        db.write_point(point)
         logging.info("Written to InfluxDB")
             
     except Exception as e:
@@ -57,7 +55,11 @@ def main():
         except:
             time.sleep(5)
 
-    client.loop_forever()
+    try:
+        client.loop_forever()
+    except KeyboardInterrupt:
+        db.close()
+        client.disconnect()
 
 if __name__ == "__main__":
     main()
