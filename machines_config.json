@@ -6,7 +6,9 @@
                 "recipe_id",
                 "job_id",
                 "batch_id",
-                "status"
+                "status",
+                "temperature",
+                "speed"
             ]
         }
     ]

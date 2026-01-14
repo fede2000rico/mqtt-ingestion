@@ -8,33 +8,47 @@ from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import SYNCHRONOUS
 from models import MachineDataCombined
 
-class MachineState:
-    def __init__(self, machine_id, expected_fields):
+class MachineBuffer:
+    def __init__(self, machine_id, expected_messages):
         self.machine_id = machine_id
-        self.expected_fields = set(expected_fields)
-        self.context: Dict[str, Any] = {}
-        self.pending_data: List[Dict[str, Any]] = []
-        self.timers: List[Timer] = []
+        # We need to map expected messages to internal queues
+        # e.g. "recipe_id" -> buffer["recipe_id"] = []
+        self.queues: Dict[str, List[Any]] = {msg_type: [] for msg_type in expected_messages}
+        # Data/Status/Etc are treated equally here since config defines expected fields.
+        
+        # Max buffer size to avoid memory leak if unaligned
+        self.MAX_SIZE = 100
 
-    def update_context(self, key, value):
-        self.context[key] = value
+    def add_message(self, msg_type, payload):
+        if msg_type in self.queues:
+            self.queues[msg_type].append(payload)
+            # Simple overflow protection
+            if len(self.queues[msg_type]) > self.MAX_SIZE:
+                 self.queues[msg_type].pop(0)
+                 logging.warning(f"[{self.machine_id}] Queue '{msg_type}' overflow, dropped oldest.")
 
-    def is_context_complete(self):
-        # Check if all expected fields are in the current context
-        return self.expected_fields.issubset(self.context.keys())
+    def is_row_ready(self):
+        # Ready if ALL queues have at least 1 item
+        return all(len(q) > 0 for q in self.queues.values())
 
-    def get_combined_data(self, data_payload):
-        combined = self.context.copy()
-        combined.update(data_payload)
-        combined["machine_id"] = self.machine_id
-        return combined
+    def pop_row(self):
+        if not self.is_row_ready():
+            return None
+        
+        row_data = {}
+        for msg_type in self.queues:
+            # Pop the oldest
+            item = self.queues[msg_type].pop(0)
+            row_data.update(item)
+        
+        row_data["machine_id"] = self.machine_id
+        return row_data
 
 class IngestionManager:
     def __init__(self, config: Dict):
         self.config = config
-        self.machines: Dict[str, MachineState] = {}
-        self.timeout_seconds = 5.0 # Wait up to 5s for context
-
+        self.machines: Dict[str, MachineBuffer] = {}
+        
         # InfluxDB Init
         self.url = os.getenv("INFLUXDB_URL", "http://influxdb:8086")
         self.token = os.getenv("INFLUXDB_TOKEN", "my-super-secret-auth-token")
@@ -44,113 +58,81 @@ class IngestionManager:
         try:
             self.client = InfluxDBClient(url=self.url, token=self.token, org=self.org)
             self.write_api = self.client.write_api(write_options=SYNCHRONOUS)
-            logging.info("InfluxDB Client Initialized")
+            logging.info("InfluxDB Client Initialized (Buffered Mode)")
         except Exception as e:
             logging.error(f"Failed to init InfluxDB: {e}")
 
         # Initialize Machines
         for m in config.get("machines", []):
             mid = m["machine_id"]
-            self.machines[mid] = MachineState(mid, m.get("expected_messages", []))
+            # "expected_messages" keys are what we queue
+            self.machines[mid] = MachineBuffer(mid, m.get("expected_messages", []))
 
     def process_message(self, topic, payload: dict):
         machine_id = payload.get("machine_id")
-        if not machine_id:
+        if not machine_id or machine_id not in self.machines:
             return
 
-        if machine_id not in self.machines:
-            # Auto-register or Ignore? Let's ignore for safety unless configured
-            # But specific requirements said "from config", so we check config.
-            # If not in config, maybe we should warn.
-            logging.warning(f"Unknown machine_id: {machine_id}")
-            return
-
-        state = self.machines[machine_id]
-
-        # Identify message type and update context
-        # We assume keys correspond to config expected_messages
-        # E.g. {"recipe_id": "..."} update context
+        buffer = self.machines[machine_id]
         
-        is_data = False
+        # Identify "Type" of message to route to correct queue
+        # Heuristic: Check which key from expected_messages is present'
+        # Note: If a message contains multiple keys, we might queue it in multiple queues or just one?
+        # User implies separated messages: "recipe", "job", "batch".
         
-        # Simple heuristic: if it contains 'temperature' or 'speed' or 'alarm' -> Data
-        # Else -> Context (if matches expected keys)
+        # Special case: "telemetry" usually contains temperature/speed.
+        # But config says: ["recipe_id", "job_id", "batch_id", "status"] in previous example.
+        # If config was ["recipe_id", "temperature"], we look for those keys.
         
-        data_keys = ["temperature", "speed", "alarm_code", "alarm_message"]
-        if any(k in payload for k in data_keys):
-            is_data = True
+        enqueued = False
+        for key in buffer.queues.keys():
+            # If payload has this key (and maybe others), we treat it as that type
+            # Problem: if payload has {recipe_id: 1, job_id: 2}, do we add to both?
+            # User said "queue for EACH data type".
+            # I will assume "Fragmented" input: only one key per message.
+            if key in payload:
+                buffer.add_message(key, payload)
+                logging.debug(f"[{machine_id}] Enqueued {key}")
+                enqueued = True
+
+        # Handle "Data" / "Telemetry" implicitly if not explicitly in proper keys?
+        # If user config has "temperature", we queue it.
+        # If the user configuration does NOT list 'temperature' but explicitly lists 'recipe',
+        # and we receive 'temperature', we drop it?
+        # The user instructions were vague on config structure for "buffered".
+        # I will assume the config lists ALL keys we want to sync.
         
-        # Update context
-        for key, value in payload.items():
-            if key in state.expected_fields:
-                state.update_context(key, value)
-                logging.debug(f"[{machine_id}] Context Updated: {key}={value}")
+        if enqueued:
+            self._check_and_flush(buffer)
 
-        if is_data:
-            self._handle_data(state, payload)
+    def _check_and_flush(self, buffer: MachineBuffer):
+        # Loop while we have complete rows
+        while buffer.is_row_ready():
+            row = buffer.pop_row()
+            if row:
+                self._write_to_influx(row)
 
-    def _handle_data(self, state: MachineState, data_payload: dict):
-        if state.is_context_complete():
-            logging.info(f"[{state.machine_id}] Context Complete. Writing Data immediately.")
-            self._write_to_influx(state, data_payload)
-        else:
-            logging.info(f"[{state.machine_id}] Context Partial. Buffering Data... (Waiting {self.timeout_seconds}s)")
-            # Buffer data and set timeout
-            # We use a closure or partial to capture the specific data instance
-            state.pending_data.append(data_payload)
-            
-            t = Timer(self.timeout_seconds, self._flush_buffered_data, args=[state, data_payload])
-            state.timers.append(t)
-            t.start()
-
-    def _flush_buffered_data(self, state: MachineState, data_payload: dict):
-        # This is called after timeout.
-        # We check if context is now complete (maybe it arrived while waiting).
-        # Regardless, we write what we have (Partial or Full).
-        
-        # Remove from pending (logic simplified here)
-        if data_payload in state.pending_data:
-            state.pending_data.remove(data_payload)
-            
-        if state.is_context_complete():
-            logging.info(f"[{state.machine_id}] Timeout Reached: Context NOW Complete. Writing.")
-        else:
-            logging.warning(f"[{state.machine_id}] Timeout Reached: Context STILL Missing {state.expected_fields - state.context.keys()}. Writing Partial.")
-
-        self._write_to_influx(state, data_payload)
-
-    def _write_to_influx(self, state: MachineState, data_payload: dict):
+    def _write_to_influx(self, combined_dict: dict):
         try:
-            # Combine Context + Data
-            combined_dict = state.get_combined_data(data_payload)
-            
-            # Use Pydantic to validate/sanitize
-            # (Note: Pydantic model here is permissive with Optionals, allows partials)
+            # Use Pydantic to validate
             model = MachineDataCombined(**combined_dict)
             
             point = Point("production_data").tag("machine_id", model.machine_id)
             
-            # Tags (Context)
             if model.recipe_id: point.tag("recipe_id", model.recipe_id)
             if model.job_id: point.tag("job_id", model.job_id)
             if model.batch_id: point.tag("batch_id", model.batch_id)
             if model.status: point.tag("status", model.status)
             
-            # Fields (Data)
             if model.temperature is not None: point.field("temperature", model.temperature)
             if model.speed is not None: point.field("speed", model.speed)
-            if model.alarm_code: 
-                point.field("alarm_code", model.alarm_code)
-                if model.alarm_message: point.field("alarm_message", model.alarm_message)
+            if model.alarm_code: point.field("alarm_code", model.alarm_code)
 
             self.write_api.write(bucket=self.bucket, org=self.org, record=point)
-            logging.info(f"[{state.machine_id}] WROTE: {model.model_dump(exclude_none=True)}")
+            logging.info(f"[{model.machine_id}] WROTE Buffered Row: {model.model_dump(exclude_none=True)}")
             
         except Exception as e:
             logging.error(f"Write Error: {e}")
 
     def close(self):
-        for m in self.machines.values():
-            for t in m.timers:
-                t.cancel()
         self.client.close()
